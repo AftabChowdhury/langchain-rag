@@ -13,7 +13,14 @@ Agentic RAG training project: a Streamlit app where a user uploads a PDF and ask
 
 ## Layout
 
-- `src/langchain_rag/app.py`: the whole app (models, Weaviate client/vector store, PDF indexing, `search_document` tool, agent, Q&A UI)
+- `src/langchain_rag/app.py`: Streamlit UI only: `@st.cache_resource` getters for shared resources, indexing flow, Q&A rendering
+- `config.py`: `Settings` dataclass (env vars plus collection name, chunking, k, web result count)
+- `models.py`: Azure chat model and embeddings builders
+- `vector_store.py`: Weaviate connect, `WeaviateVectorStore` builder, `delete_collection`
+- `ingestion.py`: `load_pdf(bytes, name)`, `split_documents`
+- `tools.py`: `make_search_document_tool(vector_store, k)`, `make_web_search_tool(max_results)` factories plus formatters
+- `agents.py`: system prompts, `build_document_agent`, `build_general_agent`, `ask(agent, question) -> messages`
+- Only `app.py` imports Streamlit; the other modules are plain Python and can be tested without it.
 - `tests/`: empty so far
 
 ## Running
@@ -36,9 +43,10 @@ Never print or commit `.env` values. `load_dotenv()` finds `.env` by searching u
 
 ## App behavior and gotchas
 
-- Collection name: `document_chunks_agentic_rag`. Each new upload **deletes the collection** (`reset_collection`), so only one PDF is indexed at a time.
-- The vector store is cached with `@st.cache_resource`; after deleting the collection, call `get_vector_store.clear()` and rebuild it before `add_documents`.
+- Collection name: `document_chunks_agentic_rag`. Each new upload **deletes the collection** (`vector_store.delete_collection`), so only one PDF is indexed at a time.
+- The vector store is cached with `@st.cache_resource`; after deleting the collection, `index_pdf` clears `get_vector_store` and `get_document_agent` and rebuilds the store before `add_documents`. Uploads are tracked by `UploadedFile.file_id`, and the PDF is parsed before the old collection is deleted.
 - Chunking: `chunk_size=1000`, `chunk_overlap=200`, `add_start_index=True`. Chunk metadata includes `source` (uploaded file name) and `page` (0-based from PyPDF; shown 1-based in tool output).
 - `search_document` returns the top 4 similarity-search hits as a string with source/page headers; the agent's system prompt tells it to answer only from retrieved passages and cite pages.
-- Agent output: `agent.invoke({"messages": [...]})["messages"][-1].content`; intermediate tool calls are shown in an "Agent steps" expander.
+- With no PDF in the uploader, questions go to the general agent (`build_general_agent`), which answers directly and has a `web_search` tool (DuckDuckGo metasearch via the `ddgs` package, no API key). These free search backends sometimes rate-limit or bot-block requests; the tool returns "Web search failed: ..." and the model says it couldn't find the answer.
+- Agent output: `agents.ask(agent, question)` returns the message list; the answer is `messages[-1].content`; intermediate tool calls are shown in an "Agent steps" expander.
 - For end-to-end tests against real services, use a throwaway Weaviate collection and delete it afterwards rather than touching `document_chunks_agentic_rag`.

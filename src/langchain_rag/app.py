@@ -1,211 +1,188 @@
-import os
-import tempfile
-from pathlib import Path
+"""Streamlit UI for the agentic RAG app.
+
+Run with:  .venv\\Scripts\\streamlit run src\\langchain_rag\\app.py
+"""
+
+from __future__ import annotations
+
+import atexit
+from typing import Any
 
 import streamlit as st
-import weaviate
 from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain.tools import tool
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.messages import AnyMessage
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_weaviate.vectorstores import WeaviateVectorStore
+from streamlit.runtime.uploaded_file_manager import UploadedFile
+from weaviate import WeaviateClient
+
+from langchain_rag.agents import ask, build_document_agent, build_general_agent
+from langchain_rag.config import Settings
+from langchain_rag.ingestion import load_pdf, split_documents
+from langchain_rag.models import build_chat_model, build_embeddings
+from langchain_rag.vector_store import (
+    build_vector_store,
+    connect_weaviate,
+    delete_collection,
+)
 
 load_dotenv()
 
-st.set_page_config(page_title="Agentic RAG", page_icon="🤖")
-st.title("Agentic RAG with LangChain + Weaviate")
-
-collection_name = "document_chunks_agentic_rag"
+# Session-state key holding the file_id of the upload currently in Weaviate.
+INDEXED_FILE_KEY = "indexed_file_id"
 
 
 # -------------------------------------------------------------------
-# 1. Create models
-# -------------------------------------------------------------------
-
-llm = AzureChatOpenAI(
-    azure_deployment=os.getenv("AZURE_COMPLETION_MODEL", "gpt-4o"),
-    api_version=os.getenv("OPENAI_API_VERSION"),
-    temperature=0,
-)
-
-embeddings = AzureOpenAIEmbeddings(
-    azure_deployment=os.getenv(
-        "AZURE_EMBEDDING_MODEL",
-        "text-embedding-3-large",
-    ),
-    api_version=os.getenv("OPENAI_API_VERSION"),
-)
-
-
-# -------------------------------------------------------------------
-# 2. Create Weaviate client and vector store once
+# Shared resources (created once per server process)
 # -------------------------------------------------------------------
 
 
 @st.cache_resource
-def get_weaviate_client():
-    return weaviate.connect_to_local()
+def get_settings() -> Settings:
+    return Settings.from_env()
 
 
 @st.cache_resource
-def get_vector_store():
-    client = get_weaviate_client()
+def get_llm() -> AzureChatOpenAI:
+    return build_chat_model(get_settings())
 
-    return WeaviateVectorStore(
-        client=client,
-        index_name=collection_name,
-        text_key="text",
-        embedding=embeddings,
+
+@st.cache_resource
+def get_embeddings() -> AzureOpenAIEmbeddings:
+    return build_embeddings(get_settings())
+
+
+@st.cache_resource
+def get_weaviate_client() -> WeaviateClient:
+    client = connect_weaviate()
+    atexit.register(client.close)
+    return client
+
+
+@st.cache_resource
+def get_vector_store() -> WeaviateVectorStore:
+    return build_vector_store(
+        get_weaviate_client(), get_embeddings(), get_settings().collection_name
     )
 
 
-client = get_weaviate_client()
-vector_store = get_vector_store()
+@st.cache_resource
+def get_document_agent() -> Any:
+    settings = get_settings()
+    return build_document_agent(get_llm(), get_vector_store(), k=settings.retrieval_k)
+
+
+@st.cache_resource
+def get_general_agent() -> Any:
+    return build_general_agent(get_llm(), max_results=get_settings().web_max_results)
 
 
 # -------------------------------------------------------------------
-# 3. Helper: reset collection
+# Indexing
 # -------------------------------------------------------------------
 
 
-def reset_collection() -> None:
-    if client.collections.exists(collection_name):
-        client.collections.delete(collection_name)
+def index_pdf(uploaded_file: UploadedFile) -> int:
+    """Replace the indexed document with ``uploaded_file``; return the chunk count."""
+    settings = get_settings()
 
-
-# -------------------------------------------------------------------
-# 4. Streamlit inputs
-# -------------------------------------------------------------------
-
-uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
-question = st.text_input("Ask a question")
-
-if "indexed_file_name" not in st.session_state:
-    st.session_state.indexed_file_name = None
-
-
-# -------------------------------------------------------------------
-# 5. Index uploaded PDF
-# -------------------------------------------------------------------
-
-if uploaded_file and uploaded_file.name != st.session_state.indexed_file_name:
-    with st.spinner("Indexing document..."):
-        reset_collection()
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            temp_file.write(uploaded_file.read())
-            file_path = Path(temp_file.name)
-
-        # -------------------------------------------------------------------------------
-        # Step 1:
-        # Use PyPDFLoader to parse the uploaded pdf file in file_path, split the parsed
-        # documents into chunks and store them in the WeaviateVectorStore vector_store.
-        # -------------------------------------------------------------------------------
-        try:
-            docs = PyPDFLoader(str(file_path)).load()
-        finally:
-            file_path.unlink(missing_ok=True)
-
-        for doc in docs:
-            doc.metadata["source"] = uploaded_file.name
-
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            add_start_index=True,
+    # Parse before touching Weaviate so a bad PDF doesn't wipe the current index.
+    pages = load_pdf(uploaded_file.getvalue(), uploaded_file.name)
+    chunks = split_documents(pages, settings.chunk_size, settings.chunk_overlap)
+    if not chunks:
+        raise ValueError(
+            "No text could be extracted from this PDF (it may be a scanned image)."
         )
-        chunks = splitter.split_documents(docs)
 
-        # The collection was just deleted, so rebuild the vector store to recreate it
-        get_vector_store.clear()
-        vector_store = get_vector_store()
-        vector_store.add_documents(chunks)
-
-        st.session_state.indexed_file_name = uploaded_file.name
-        st.success(f"Indexed {len(chunks)} chunks from {uploaded_file.name}.")
+    delete_collection(get_weaviate_client(), settings.collection_name)
+    # The cached store and agent point at the deleted collection; rebuild them.
+    get_vector_store.clear()
+    get_document_agent.clear()
+    get_vector_store().add_documents(chunks)
+    return len(chunks)
 
 
-# -------------------------------------------------------------------
-# 6. Create retriever tool
-# -------------------------------------------------------------------
+def sync_index(uploaded_file: UploadedFile | None) -> bool:
+    """Index ``uploaded_file`` if it is new; return whether it is ready to query."""
+    if uploaded_file is None:
+        return False
+    if st.session_state.get(INDEXED_FILE_KEY) == uploaded_file.file_id:
+        return True
 
-# -------------------------------------------------------------------------------
-# Step 2:
-# Create a tool function search_document that takes a user query as input, performs a similarity
-# search on the vector_store and returns the retrieved document chunks as a string.
-# -------------------------------------------------------------------------------
+    with st.spinner("Indexing document..."):
+        try:
+            chunk_count = index_pdf(uploaded_file)
+        except Exception as exc:
+            st.session_state[INDEXED_FILE_KEY] = None
+            st.error(f"Could not index {uploaded_file.name}: {exc}")
+            return False
 
-
-@tool
-def search_document(query: str) -> str:
-    """Search the uploaded PDF document for passages relevant to the query.
-
-    Use this tool for any question about the content of the uploaded document.
-    """
-    results = vector_store.similarity_search(query, k=4)
-    if not results:
-        return "No relevant passages found in the document."
-
-    return "\n\n---\n\n".join(
-        f"[Source: {doc.metadata.get('source', 'unknown')}, "
-        f"page {int(doc.metadata.get('page', 0)) + 1}]\n{doc.page_content}"
-        for doc in results
-    )
+    st.session_state[INDEXED_FILE_KEY] = uploaded_file.file_id
+    st.success(f"Indexed {chunk_count} chunks from {uploaded_file.name}.")
+    return True
 
 
 # -------------------------------------------------------------------
-# 7. Create agent
+# Rendering
 # -------------------------------------------------------------------
 
-# -------------------------------------------------------------------------------
-# Step 3:
-# Create the agent using create_agent with the llm, the search tool and a
-# system prompt that instructs the agent to use the search tool when the user asks
-# about the uploaded PDF.
-# -------------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant that answers questions about an uploaded PDF document. "
-    "Whenever the user asks about the document, call the `search_document` tool to "
-    "retrieve relevant passages, and base your answer only on what it returns. "
-    "You may call the tool several times with different queries if needed. "
-    "Cite page numbers where possible. If the answer is not in the retrieved "
-    "passages, say that you could not find it in the document."
-)
-
-agent = create_agent(
-    model=llm,
-    tools=[search_document],
-    system_prompt=SYSTEM_PROMPT,
-)
+def render_agent_steps(messages: list[AnyMessage]) -> None:
+    with st.expander("Agent steps"):
+        for message in messages:
+            tool_calls = getattr(message, "tool_calls", None)
+            if tool_calls:
+                for call in tool_calls:
+                    st.markdown(f"**Tool call:** `{call['name']}({call['args']})`")
+            elif message.type == "tool":
+                st.text(message.content)
 
 
-# -------------------------------------------------------------------
-# 8. Ask the agent
-# -------------------------------------------------------------------
-
-if question:
-    if st.session_state.indexed_file_name is None:
-        st.warning("Please upload a PDF first.")
+def answer(question: str, uploaded_file: UploadedFile | None, pdf_ready: bool) -> None:
+    if pdf_ready and uploaded_file is not None:
+        agent = get_document_agent()
+        st.caption(f"Answering from: {uploaded_file.name}")
     else:
-        # -------------------------------------------------------------------------------
-        # Step 4:
-        # Invoke the agent with the user question and display the answer.
-        # -------------------------------------------------------------------------------
-        with st.spinner("Thinking..."):
-            result = agent.invoke(
-                {"messages": [{"role": "user", "content": question}]}
-            )
+        agent = get_general_agent()
+        st.caption("No PDF uploaded: answering with the model and web search.")
 
-        st.markdown(result["messages"][-1].content)
+    with st.spinner("Thinking..."):
+        try:
+            messages = ask(agent, question)
+        except Exception as exc:
+            st.error(f"The agent failed to answer: {exc}")
+            return
 
-        with st.expander("Agent steps"):
-            for message in result["messages"]:
-                tool_calls = getattr(message, "tool_calls", None)
-                if tool_calls:
-                    for call in tool_calls:
-                        st.markdown(f"**Tool call:** `{call['name']}({call['args']})`")
-                elif message.type == "tool":
-                    st.text(message.content)
+    st.markdown(messages[-1].content)
+    render_agent_steps(messages)
+
+
+# -------------------------------------------------------------------
+# Page
+# -------------------------------------------------------------------
+
+
+def main() -> None:
+    st.set_page_config(page_title="Agentic RAG", page_icon="🤖")
+    st.title("Agentic RAG with LangChain + Weaviate")
+
+    try:
+        get_weaviate_client()
+    except Exception as exc:
+        st.error(
+            "Could not connect to Weaviate on localhost:8080 (gRPC 50051). "
+            f"Is it running?\n\n{exc}"
+        )
+        st.stop()
+
+    uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
+    question = st.text_input("Ask a question")
+
+    pdf_ready = sync_index(uploaded_file)
+
+    if question:
+        answer(question, uploaded_file, pdf_ready)
+
+
+if __name__ == "__main__":
+    main()
